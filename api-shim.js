@@ -36,9 +36,54 @@
     };
   }
 
-  var rawOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function (method, url) {
-    var m = mapUrl(url); if (m) arguments[1] = m;
-    return rawOpen.apply(this, arguments);
+
+  /* XHR 兜底：应用里有地方用 XMLHttpRequest（axios），
+     这里对映射过的接口直接走 fetch 取快照，再模拟出 onload */
+  var NativeXHR = window.XMLHttpRequest;
+  var nativeOpen = NativeXHR.prototype.open;
+  var nativeSend = NativeXHR.prototype.send;
+
+  NativeXHR.prototype.open = function (method, url) {
+    this.__mapped = mapUrl(url);
+    return nativeOpen.apply(this, arguments);
   };
+
+  NativeXHR.prototype.send = function (body) {
+    var self = this;
+    var mapped = this.__mapped;
+    if (!mapped) return nativeSend.apply(this, arguments);
+
+    var loadText = function (url) {
+      return window.fetch(url, { cache: 'no-store' }).then(function (r) {
+        return r.text().then(function (t) { return { status: r.status, text: t }; });
+      });
+    };
+    var snapshot = snapshotFor(mapped);
+    var primary = loadText(mapped).then(function (res) {
+      if (res.status >= 200 && res.status < 300) return res;
+      if (!snapshot) return res;
+      return loadText(snapshot);
+    }).catch(function () {
+      if (!snapshot) throw new Error('network');
+      return loadText(snapshot);
+    });
+
+    primary.then(function (res) {
+      Object.defineProperty(self, 'readyState', { value: 4, configurable: true });
+      Object.defineProperty(self, 'status', { value: res.status, configurable: true });
+      Object.defineProperty(self, 'responseText', { value: res.text, configurable: true });
+      Object.defineProperty(self, 'response', { value: res.text, configurable: true });
+      self.getAllResponseHeaders = function () { return 'content-type: application/json\r\n'; };
+      self.getResponseHeader = function (k) {
+        return String(k).toLowerCase() === 'content-type' ? 'application/json' : null;
+      };
+      if (typeof self.onreadystatechange === 'function') self.onreadystatechange();
+      if (typeof self.onload === 'function') self.onload();
+      try { self.dispatchEvent(new Event('load')); } catch (e) {}
+    }).catch(function (err) {
+      if (typeof self.onerror === 'function') self.onerror(err);
+      try { self.dispatchEvent(new Event('error')); } catch (e) {}
+    });
+  };
+
 })();
